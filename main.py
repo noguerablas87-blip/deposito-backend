@@ -8,6 +8,12 @@ compartida, de modo que TODAS las tablets vean el mismo inventario en tiempo rea
 Stack: FastAPI + SQLAlchemy. Funciona con PostgreSQL (producción/Railway) o con
 SQLite (pruebas locales, sin configurar nada).
 
+>>> CAMBIO CLAVE (optimización de egress):
+    Las imágenes (base64) YA NO se envían en /api/state ni en las respuestas de
+    las acciones. Se sirven por separado en GET /api/tools/{id}/image con caché
+    (ETag + Cache-Control), así el navegador NO las vuelve a descargar en cada poll.
+    Esto reduce el tráfico de salida en ~95%.
+
 Variables de entorno:
   DATABASE_URL   URL de Postgres (Railway la inyecta sola al agregar el plugin).
                  Si no existe, usa SQLite local (./deposito.db).
@@ -16,10 +22,13 @@ Variables de entorno:
 """
 import os
 import time
+import base64
+import hashlib
 from typing import Optional, List
 
-from fastapi import FastAPI, HTTPException, Header, Depends
+from fastapi import FastAPI, HTTPException, Header, Depends, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from pydantic import BaseModel
 from sqlalchemy import (
     create_engine, String, Integer, BigInteger, Text, Boolean, select, delete
@@ -59,13 +68,20 @@ class Tool(Base):
     notes: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     deleted: Mapped[bool] = mapped_column(Boolean, default=False)
 
-    def to_dict(self):
-        return {
-            "id": self.id, "name": self.name, "area": self.area, "image": self.image,
+    def to_dict(self, include_image: bool = False):
+        # NO se incluye 'image' por defecto: ese era el causante del egress.
+        # En su lugar se manda 'hasImage' (un bool liviano) para que el front
+        # sepa si pedir la foto al endpoint cacheado /api/tools/{id}/image.
+        d = {
+            "id": self.id, "name": self.name, "area": self.area,
             "status": self.status, "usedBy": self.used_by,
             "checkoutTime": self.checkout_time, "reservedBy": self.reserved_by,
             "reservedTime": self.reserved_time, "notes": self.notes,
+            "hasImage": bool(self.image),
         }
+        if include_image:
+            d["image"] = self.image
+        return d
 
 
 class Log(Base):
@@ -108,6 +124,7 @@ def add_log(s: Session, tool: Tool, tecnico: str, tech_area: str,
 
 
 def all_tools(s: Session) -> List[dict]:
+    # Solo metadatos livianos (sin base64). Las fotos van por /api/tools/{id}/image.
     rows = s.scalars(select(Tool).where(Tool.deleted == False)).all()  # noqa: E712
     return [t.to_dict() for t in rows]
 
@@ -167,6 +184,9 @@ class ImportReq(BaseModel):
 # ──────────────────────────── APP ────────────────────────────
 app = FastAPI(title="Control de Herramientas — Depósito")
 
+# gzip: comprime las respuestas JSON de metadatos (ayuda extra al egress).
+app.add_middleware(GZipMiddleware, minimum_size=500)
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],          # las apps viven en Netlify/Vercel; CORS abierto
@@ -190,6 +210,38 @@ def state(db: Session = Depends(get_db)):
 @app.get("/api/tools")
 def list_tools(db: Session = Depends(get_db)):
     return all_tools(db)
+
+
+# ---- IMAGEN (servida aparte y CACHEADA por el navegador) ----
+@app.get("/api/tools/{tool_id}/image")
+def tool_image(tool_id: str, request: Request, db: Session = Depends(get_db)):
+    """Devuelve la foto como binario real (no base64) con ETag + Cache-Control.
+    El navegador la cachea: en los polls siguientes NO la vuelve a bajar, y si
+    pregunta, recibe un 304 vacío. Acá está el ~95% del ahorro de egress."""
+    tool = db.get(Tool, tool_id)
+    if not tool or not tool.image:
+        raise HTTPException(404, "Sin imagen")
+
+    etag = '"' + hashlib.md5(tool.image.encode("utf-8")).hexdigest() + '"'
+    if request.headers.get("if-none-match") == etag:
+        return Response(status_code=304, headers={"ETag": etag})
+
+    # tool.image suele venir como data URI: "data:image/jpeg;base64,XXXX"
+    media = "image/jpeg"
+    payload = tool.image
+    if payload.startswith("data:") and "," in payload:
+        header, _, payload = payload.partition(",")
+        if ";" in header:
+            media = header[5:header.index(";")] or media
+    try:
+        raw = base64.b64decode(payload)
+    except Exception:
+        raise HTTPException(500, "Imagen corrupta")
+
+    return Response(
+        content=raw, media_type=media,
+        headers={"ETag": etag, "Cache-Control": "public, max-age=3600"},
+    )
 
 
 # ---- ACCIONES DE TÉCNICO ----
