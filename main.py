@@ -8,12 +8,6 @@ compartida, de modo que TODAS las tablets vean el mismo inventario en tiempo rea
 Stack: FastAPI + SQLAlchemy. Funciona con PostgreSQL (producción/Railway) o con
 SQLite (pruebas locales, sin configurar nada).
 
->>> CAMBIO CLAVE (optimización de egress):
-    Las imágenes (base64) YA NO se envían en /api/state ni en las respuestas de
-    las acciones. Se sirven por separado en GET /api/tools/{id}/image con caché
-    (ETag + Cache-Control), así el navegador NO las vuelve a descargar en cada poll.
-    Esto reduce el tráfico de salida en ~95%.
-
 Variables de entorno:
   DATABASE_URL   URL de Postgres (Railway la inyecta sola al agregar el plugin).
                  Si no existe, usa SQLite local (./deposito.db).
@@ -26,9 +20,8 @@ import base64
 import hashlib
 from typing import Optional, List
 
-from fastapi import FastAPI, HTTPException, Header, Depends, Request, Response
+from fastapi import FastAPI, HTTPException, Header, Depends, Response
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.middleware.gzip import GZipMiddleware
 from pydantic import BaseModel
 from sqlalchemy import (
     create_engine, String, Integer, BigInteger, Text, Boolean, select, delete
@@ -68,20 +61,13 @@ class Tool(Base):
     notes: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     deleted: Mapped[bool] = mapped_column(Boolean, default=False)
 
-    def to_dict(self, include_image: bool = False):
-        # NO se incluye 'image' por defecto: ese era el causante del egress.
-        # En su lugar se manda 'hasImage' (un bool liviano) para que el front
-        # sepa si pedir la foto al endpoint cacheado /api/tools/{id}/image.
-        d = {
-            "id": self.id, "name": self.name, "area": self.area,
+    def to_dict(self):
+        return {
+            "id": self.id, "name": self.name, "area": self.area, "image": self.image,
             "status": self.status, "usedBy": self.used_by,
             "checkoutTime": self.checkout_time, "reservedBy": self.reserved_by,
             "reservedTime": self.reserved_time, "notes": self.notes,
-            "hasImage": bool(self.image),
         }
-        if include_image:
-            d["image"] = self.image
-        return d
 
 
 class Log(Base):
@@ -106,6 +92,32 @@ class Log(Base):
         }
 
 
+class Loan(Base):
+    """Equipo prestado a un cliente (UPS, aire portátil, servidor, etc.)."""
+    __tablename__ = "deposito_loans"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    equipo: Mapped[str] = mapped_column(String(200))
+    cliente: Mapped[str] = mapped_column(String(200))
+    notas: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    photo: Mapped[Optional[str]] = mapped_column(Text, nullable=True)   # base64 jpeg (servido aparte)
+    tecnico: Mapped[str] = mapped_column(String(120))
+    area: Mapped[str] = mapped_column(String(40), index=True)
+    estado: Mapped[str] = mapped_column(String(20), default="en_prestamo")  # en_prestamo | retirado
+    fecha_salida: Mapped[int] = mapped_column(BigInteger)
+    fecha_retiro: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
+    retirado_por: Mapped[Optional[str]] = mapped_column(String(120), nullable=True)
+    deleted: Mapped[bool] = mapped_column(Boolean, default=False)
+
+    def to_dict(self):
+        # NO incluye la foto (se sirve por /api/loans/{id}/photo para no inflar el polling)
+        return {
+            "id": self.id, "equipo": self.equipo, "cliente": self.cliente,
+            "notas": self.notas, "hasPhoto": bool(self.photo), "tecnico": self.tecnico,
+            "area": self.area, "estado": self.estado, "fechaSalida": self.fecha_salida,
+            "fechaRetiro": self.fecha_retiro, "retiradoPor": self.retirado_por,
+        }
+
+
 Base.metadata.create_all(engine)
 
 
@@ -124,7 +136,6 @@ def add_log(s: Session, tool: Tool, tecnico: str, tech_area: str,
 
 
 def all_tools(s: Session) -> List[dict]:
-    # Solo metadatos livianos (sin base64). Las fotos van por /api/tools/{id}/image.
     rows = s.scalars(select(Tool).where(Tool.deleted == False)).all()  # noqa: E712
     return [t.to_dict() for t in rows]
 
@@ -181,11 +192,22 @@ class ImportReq(BaseModel):
     overwrite: bool = False
 
 
+class LoanReq(BaseModel):
+    equipo: str
+    cliente: str
+    notas: Optional[str] = ""
+    photo: Optional[str] = None   # base64 jpeg (sin encabezado data:)
+    tecnico: str
+    area: str
+
+
+class LoanActionReq(BaseModel):
+    tecnico: str
+    area: str
+
+
 # ──────────────────────────── APP ────────────────────────────
 app = FastAPI(title="Control de Herramientas — Depósito")
-
-# gzip: comprime las respuestas JSON de metadatos (ayuda extra al egress).
-app.add_middleware(GZipMiddleware, minimum_size=500)
 
 app.add_middleware(
     CORSMiddleware,
@@ -210,38 +232,6 @@ def state(db: Session = Depends(get_db)):
 @app.get("/api/tools")
 def list_tools(db: Session = Depends(get_db)):
     return all_tools(db)
-
-
-# ---- IMAGEN (servida aparte y CACHEADA por el navegador) ----
-@app.get("/api/tools/{tool_id}/image")
-def tool_image(tool_id: str, request: Request, db: Session = Depends(get_db)):
-    """Devuelve la foto como binario real (no base64) con ETag + Cache-Control.
-    El navegador la cachea: en los polls siguientes NO la vuelve a bajar, y si
-    pregunta, recibe un 304 vacío. Acá está el ~95% del ahorro de egress."""
-    tool = db.get(Tool, tool_id)
-    if not tool or not tool.image:
-        raise HTTPException(404, "Sin imagen")
-
-    etag = '"' + hashlib.md5(tool.image.encode("utf-8")).hexdigest() + '"'
-    if request.headers.get("if-none-match") == etag:
-        return Response(status_code=304, headers={"ETag": etag})
-
-    # tool.image suele venir como data URI: "data:image/jpeg;base64,XXXX"
-    media = "image/jpeg"
-    payload = tool.image
-    if payload.startswith("data:") and "," in payload:
-        header, _, payload = payload.partition(",")
-        if ";" in header:
-            media = header[5:header.index(";")] or media
-    try:
-        raw = base64.b64decode(payload)
-    except Exception:
-        raise HTTPException(500, "Imagen corrupta")
-
-    return Response(
-        content=raw, media_type=media,
-        headers={"ETag": etag, "Cache-Control": "public, max-age=3600"},
-    )
 
 
 # ---- ACCIONES DE TÉCNICO ----
@@ -459,3 +449,81 @@ def import_data(req: ImportReq, db: Session = Depends(get_db)):
         n_logs += 1
     db.commit()
     return {"ok": True, "imported_tools": n_tools, "imported_logs": n_logs}
+
+
+# ──────────────────────── EQUIPOS EN PRÉSTAMO ────────────────────────
+def _strip_b64(s: str) -> str:
+    """Quita el encabezado 'data:image/...;base64,' si viene incluido."""
+    if s and "," in s and s.strip().startswith("data:"):
+        return s.split(",", 1)[1]
+    return s
+
+
+@app.get("/api/loans")
+def list_loans(estado: Optional[str] = None, db: Session = Depends(get_db)):
+    """Lista de préstamos (sin la foto). estado opcional: en_prestamo | retirado."""
+    stmt = select(Loan).where(Loan.deleted == False)  # noqa: E712
+    if estado:
+        stmt = stmt.where(Loan.estado == estado)
+    rows = db.scalars(stmt.order_by(Loan.id.desc())).all()
+    return [r.to_dict() for r in rows]
+
+
+@app.get("/api/loans/{loan_id}/photo")
+def loan_photo(loan_id: int, response: Response,
+               if_none_match: Optional[str] = Header(default=None),
+               db: Session = Depends(get_db)):
+    """Devuelve la foto del equipo como JPEG, cacheable (ETag) para no repetir egreso."""
+    loan = db.get(Loan, loan_id)
+    if not loan or not loan.photo:
+        raise HTTPException(404, "Sin foto")
+    raw = _strip_b64(loan.photo)
+    etag = '"' + hashlib.md5(raw.encode("utf-8")).hexdigest() + '"'
+    if if_none_match == etag:
+        return Response(status_code=304, headers={"ETag": etag,
+                        "Cache-Control": "public, max-age=31536000, immutable"})
+    try:
+        data = base64.b64decode(raw)
+    except Exception:
+        raise HTTPException(500, "Foto inválida")
+    return Response(content=data, media_type="image/jpeg", headers={
+        "ETag": etag, "Cache-Control": "public, max-age=31536000, immutable"})
+
+
+@app.post("/api/loans")
+def create_loan(req: LoanReq, db: Session = Depends(get_db)):
+    if not req.equipo.strip() or not req.cliente.strip():
+        raise HTTPException(400, "Faltan datos del equipo o del cliente")
+    loan = Loan(
+        equipo=req.equipo.strip(), cliente=req.cliente.strip(),
+        notas=(req.notas or None), photo=_strip_b64(req.photo) if req.photo else None,
+        tecnico=req.tecnico, area=req.area, estado="en_prestamo",
+        fecha_salida=now_ms(),
+    )
+    db.add(loan)
+    db.commit()
+    db.refresh(loan)
+    return {"ok": True, "loan": loan.to_dict()}
+
+
+@app.post("/api/loans/{loan_id}/retrieve")
+def retrieve_loan(loan_id: int, req: LoanActionReq, db: Session = Depends(get_db)):
+    """El técnico marca que ya retiró el equipo del cliente."""
+    loan = db.get(Loan, loan_id)
+    if not loan or loan.deleted:
+        raise HTTPException(404, "Préstamo inexistente")
+    loan.estado = "retirado"
+    loan.fecha_retiro = now_ms()
+    loan.retirado_por = req.tecnico
+    db.commit()
+    return {"ok": True, "loan": loan.to_dict()}
+
+
+@app.delete("/api/loans/{loan_id}", dependencies=[Depends(require_admin)])
+def delete_loan(loan_id: int, db: Session = Depends(get_db)):
+    loan = db.get(Loan, loan_id)
+    if not loan:
+        raise HTTPException(404, "Préstamo inexistente")
+    loan.deleted = True
+    db.commit()
+    return {"ok": True}
