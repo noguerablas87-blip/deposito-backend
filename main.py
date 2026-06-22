@@ -22,6 +22,7 @@ from typing import Optional, List
 
 from fastapi import FastAPI, HTTPException, Header, Depends, Response
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from pydantic import BaseModel
 from sqlalchemy import (
     create_engine, String, Integer, BigInteger, Text, Boolean, select, delete
@@ -61,13 +62,20 @@ class Tool(Base):
     notes: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     deleted: Mapped[bool] = mapped_column(Boolean, default=False)
 
-    def to_dict(self):
-        return {
-            "id": self.id, "name": self.name, "area": self.area, "image": self.image,
+    def to_dict(self, include_image: bool = False):
+        # NO se incluye 'image' por defecto: ese base64 en cada poll era la fuga
+        # de egress. Se manda 'hasImage' (liviano) y la foto se sirve aparte en
+        # GET /api/tools/{id}/image, cacheada (mismo patrón que las fotos de préstamo).
+        d = {
+            "id": self.id, "name": self.name, "area": self.area,
             "status": self.status, "usedBy": self.used_by,
             "checkoutTime": self.checkout_time, "reservedBy": self.reserved_by,
             "reservedTime": self.reserved_time, "notes": self.notes,
+            "hasImage": bool(self.image),
         }
+        if include_image:
+            d["image"] = self.image
+        return d
 
 
 class Log(Base):
@@ -209,6 +217,9 @@ class LoanActionReq(BaseModel):
 # ──────────────────────────── APP ────────────────────────────
 app = FastAPI(title="Control de Herramientas — Depósito")
 
+# gzip: comprime las respuestas JSON de metadatos (ayuda extra al egress).
+app.add_middleware(GZipMiddleware, minimum_size=500)
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],          # las apps viven en Netlify/Vercel; CORS abierto
@@ -232,6 +243,36 @@ def state(db: Session = Depends(get_db)):
 @app.get("/api/tools")
 def list_tools(db: Session = Depends(get_db)):
     return all_tools(db)
+
+
+@app.get("/api/tools/{tool_id}/image")
+def tool_image(tool_id: str, response: Response,
+               if_none_match: Optional[str] = Header(default=None),
+               db: Session = Depends(get_db)):
+    """Sirve la imagen de la herramienta aparte y cacheada (ETag), igual que las
+    fotos de préstamo. Así el navegador NO la vuelve a bajar en cada poll: ahí
+    está el ~95% del ahorro de egress."""
+    tool = db.get(Tool, tool_id)
+    if not tool or not tool.image:
+        raise HTTPException(404, "Sin imagen")
+    # Detecta el tipo (jpeg/png/…) del data URI antes de limpiarlo
+    media = "image/jpeg"
+    src = (tool.image or "").strip()
+    if src.startswith("data:") and ";" in src[:64]:
+        media = src[5:src.index(";")] or media
+    raw = _strip_b64(tool.image)
+    etag = '"' + hashlib.md5(raw.encode("utf-8")).hexdigest() + '"'
+    # max-age moderado (1h) en vez de 'immutable': la herramienta se puede re-editar
+    # desde el admin, así que conviene que se refresque dentro de la hora.
+    cache = "public, max-age=3600"
+    if if_none_match == etag:
+        return Response(status_code=304, headers={"ETag": etag, "Cache-Control": cache})
+    try:
+        data = base64.b64decode(raw)
+    except Exception:
+        raise HTTPException(500, "Imagen inválida")
+    return Response(content=data, media_type=media,
+                    headers={"ETag": etag, "Cache-Control": cache})
 
 
 # ---- ACCIONES DE TÉCNICO ----
