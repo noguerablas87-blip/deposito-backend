@@ -22,7 +22,6 @@ from typing import Optional, List
 
 from fastapi import FastAPI, HTTPException, Header, Depends, Response
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.middleware.gzip import GZipMiddleware
 from pydantic import BaseModel
 from sqlalchemy import (
     create_engine, String, Integer, BigInteger, Text, Boolean, select, delete
@@ -62,20 +61,13 @@ class Tool(Base):
     notes: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     deleted: Mapped[bool] = mapped_column(Boolean, default=False)
 
-    def to_dict(self, include_image: bool = False):
-        # NO se incluye 'image' por defecto: ese base64 en cada poll era la fuga
-        # de egress. Se manda 'hasImage' (liviano) y la foto se sirve aparte en
-        # GET /api/tools/{id}/image, cacheada (mismo patrón que las fotos de préstamo).
-        d = {
-            "id": self.id, "name": self.name, "area": self.area,
+    def to_dict(self):
+        return {
+            "id": self.id, "name": self.name, "area": self.area, "image": self.image,
             "status": self.status, "usedBy": self.used_by,
             "checkoutTime": self.checkout_time, "reservedBy": self.reserved_by,
             "reservedTime": self.reserved_time, "notes": self.notes,
-            "hasImage": bool(self.image),
         }
-        if include_image:
-            d["image"] = self.image
-        return d
 
 
 class Log(Base):
@@ -100,29 +92,30 @@ class Log(Base):
         }
 
 
-class Loan(Base):
-    """Equipo prestado a un cliente (UPS, aire portátil, servidor, etc.)."""
-    __tablename__ = "deposito_loans"
+class Equipment(Base):
+    """Equipo prestable del inventario (UPS, aire portátil, servidor, etc.).
+    Funciona como el inventario de herramientas: tiene estado disponible/en_prestamo."""
+    __tablename__ = "deposito_equipment"
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    equipo: Mapped[str] = mapped_column(String(200))
-    cliente: Mapped[str] = mapped_column(String(200))
-    notas: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    nombre: Mapped[str] = mapped_column(String(200))
+    tipo: Mapped[str] = mapped_column(String(40), default="Otro")   # UPS | Aire | Servidor | Otro
     photo: Mapped[Optional[str]] = mapped_column(Text, nullable=True)   # base64 jpeg (servido aparte)
-    tecnico: Mapped[str] = mapped_column(String(120))
-    area: Mapped[str] = mapped_column(String(40), index=True)
-    estado: Mapped[str] = mapped_column(String(20), default="en_prestamo")  # en_prestamo | retirado
-    fecha_salida: Mapped[int] = mapped_column(BigInteger)
-    fecha_retiro: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
-    retirado_por: Mapped[Optional[str]] = mapped_column(String(120), nullable=True)
+    estado: Mapped[str] = mapped_column(String(20), default="disponible")  # disponible | en_prestamo
+    # datos del préstamo en curso (nulos cuando está disponible):
+    cliente: Mapped[Optional[str]] = mapped_column(String(200), nullable=True)
+    dias: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    tecnico: Mapped[Optional[str]] = mapped_column(String(120), nullable=True)
+    area: Mapped[Optional[str]] = mapped_column(String(40), nullable=True)
+    fecha_salida: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
     deleted: Mapped[bool] = mapped_column(Boolean, default=False)
 
     def to_dict(self):
-        # NO incluye la foto (se sirve por /api/loans/{id}/photo para no inflar el polling)
+        # NO incluye la foto (se sirve por /api/equipment/{id}/photo para no inflar el polling)
         return {
-            "id": self.id, "equipo": self.equipo, "cliente": self.cliente,
-            "notas": self.notas, "hasPhoto": bool(self.photo), "tecnico": self.tecnico,
-            "area": self.area, "estado": self.estado, "fechaSalida": self.fecha_salida,
-            "fechaRetiro": self.fecha_retiro, "retiradoPor": self.retirado_por,
+            "id": self.id, "nombre": self.nombre, "tipo": self.tipo,
+            "hasPhoto": bool(self.photo), "estado": self.estado,
+            "cliente": self.cliente, "dias": self.dias, "tecnico": self.tecnico,
+            "area": self.area, "fechaSalida": self.fecha_salida,
         }
 
 
@@ -200,25 +193,32 @@ class ImportReq(BaseModel):
     overwrite: bool = False
 
 
-class LoanReq(BaseModel):
-    equipo: str
-    cliente: str
-    notas: Optional[str] = ""
+class EquipmentReq(BaseModel):
+    nombre: str
+    tipo: Optional[str] = "Otro"
     photo: Optional[str] = None   # base64 jpeg (sin encabezado data:)
+
+
+class EquipmentEditReq(BaseModel):
+    nombre: Optional[str] = None
+    tipo: Optional[str] = None
+    photo: Optional[str] = None
+
+
+class LendReq(BaseModel):
+    cliente: str
+    dias: Optional[int] = None
     tecnico: str
     area: str
 
 
-class LoanActionReq(BaseModel):
+class ReturnReq(BaseModel):
     tecnico: str
     area: str
 
 
 # ──────────────────────────── APP ────────────────────────────
 app = FastAPI(title="Control de Herramientas — Depósito")
-
-# gzip: comprime las respuestas JSON de metadatos (ayuda extra al egress).
-app.add_middleware(GZipMiddleware, minimum_size=500)
 
 app.add_middleware(
     CORSMiddleware,
@@ -243,36 +243,6 @@ def state(db: Session = Depends(get_db)):
 @app.get("/api/tools")
 def list_tools(db: Session = Depends(get_db)):
     return all_tools(db)
-
-
-@app.get("/api/tools/{tool_id}/image")
-def tool_image(tool_id: str, response: Response,
-               if_none_match: Optional[str] = Header(default=None),
-               db: Session = Depends(get_db)):
-    """Sirve la imagen de la herramienta aparte y cacheada (ETag), igual que las
-    fotos de préstamo. Así el navegador NO la vuelve a bajar en cada poll: ahí
-    está el ~95% del ahorro de egress."""
-    tool = db.get(Tool, tool_id)
-    if not tool or not tool.image:
-        raise HTTPException(404, "Sin imagen")
-    # Detecta el tipo (jpeg/png/…) del data URI antes de limpiarlo
-    media = "image/jpeg"
-    src = (tool.image or "").strip()
-    if src.startswith("data:") and ";" in src[:64]:
-        media = src[5:src.index(";")] or media
-    raw = _strip_b64(tool.image)
-    etag = '"' + hashlib.md5(raw.encode("utf-8")).hexdigest() + '"'
-    # max-age moderado (1h) en vez de 'immutable': la herramienta se puede re-editar
-    # desde el admin, así que conviene que se refresque dentro de la hora.
-    cache = "public, max-age=3600"
-    if if_none_match == etag:
-        return Response(status_code=304, headers={"ETag": etag, "Cache-Control": cache})
-    try:
-        data = base64.b64decode(raw)
-    except Exception:
-        raise HTTPException(500, "Imagen inválida")
-    return Response(content=data, media_type=media,
-                    headers={"ETag": etag, "Cache-Control": cache})
 
 
 # ---- ACCIONES DE TÉCNICO ----
@@ -492,7 +462,7 @@ def import_data(req: ImportReq, db: Session = Depends(get_db)):
     return {"ok": True, "imported_tools": n_tools, "imported_logs": n_logs}
 
 
-# ──────────────────────── EQUIPOS EN PRÉSTAMO ────────────────────────
+# ──────────────────── INVENTARIO DE EQUIPOS EN PRÉSTAMO ────────────────────
 def _strip_b64(s: str) -> str:
     """Quita el encabezado 'data:image/...;base64,' si viene incluido."""
     if s and "," in s and s.strip().startswith("data:"):
@@ -500,25 +470,25 @@ def _strip_b64(s: str) -> str:
     return s
 
 
-@app.get("/api/loans")
-def list_loans(estado: Optional[str] = None, db: Session = Depends(get_db)):
-    """Lista de préstamos (sin la foto). estado opcional: en_prestamo | retirado."""
-    stmt = select(Loan).where(Loan.deleted == False)  # noqa: E712
+@app.get("/api/equipment")
+def list_equipment(estado: Optional[str] = None, db: Session = Depends(get_db)):
+    """Inventario de equipos (sin la foto). estado opcional: disponible | en_prestamo."""
+    stmt = select(Equipment).where(Equipment.deleted == False)  # noqa: E712
     if estado:
-        stmt = stmt.where(Loan.estado == estado)
-    rows = db.scalars(stmt.order_by(Loan.id.desc())).all()
+        stmt = stmt.where(Equipment.estado == estado)
+    rows = db.scalars(stmt.order_by(Equipment.nombre.asc())).all()
     return [r.to_dict() for r in rows]
 
 
-@app.get("/api/loans/{loan_id}/photo")
-def loan_photo(loan_id: int, response: Response,
-               if_none_match: Optional[str] = Header(default=None),
-               db: Session = Depends(get_db)):
+@app.get("/api/equipment/{eq_id}/photo")
+def equipment_photo(eq_id: int, response: Response,
+                    if_none_match: Optional[str] = Header(default=None),
+                    db: Session = Depends(get_db)):
     """Devuelve la foto del equipo como JPEG, cacheable (ETag) para no repetir egreso."""
-    loan = db.get(Loan, loan_id)
-    if not loan or not loan.photo:
+    eq = db.get(Equipment, eq_id)
+    if not eq or not eq.photo:
         raise HTTPException(404, "Sin foto")
-    raw = _strip_b64(loan.photo)
+    raw = _strip_b64(eq.photo)
     etag = '"' + hashlib.md5(raw.encode("utf-8")).hexdigest() + '"'
     if if_none_match == etag:
         return Response(status_code=304, headers={"ETag": etag,
@@ -531,40 +501,78 @@ def loan_photo(loan_id: int, response: Response,
         "ETag": etag, "Cache-Control": "public, max-age=31536000, immutable"})
 
 
-@app.post("/api/loans")
-def create_loan(req: LoanReq, db: Session = Depends(get_db)):
-    if not req.equipo.strip() or not req.cliente.strip():
-        raise HTTPException(400, "Faltan datos del equipo o del cliente")
-    loan = Loan(
-        equipo=req.equipo.strip(), cliente=req.cliente.strip(),
-        notas=(req.notas or None), photo=_strip_b64(req.photo) if req.photo else None,
-        tecnico=req.tecnico, area=req.area, estado="en_prestamo",
-        fecha_salida=now_ms(),
+@app.post("/api/equipment", dependencies=[Depends(require_admin)])
+def create_equipment(req: EquipmentReq, db: Session = Depends(get_db)):
+    """Alta de equipo al inventario (solo admin, como las herramientas)."""
+    if not req.nombre.strip():
+        raise HTTPException(400, "Falta el nombre del equipo")
+    eq = Equipment(
+        nombre=req.nombre.strip(), tipo=(req.tipo or "Otro"),
+        photo=_strip_b64(req.photo) if req.photo else None,
+        estado="disponible",
     )
-    db.add(loan)
+    db.add(eq)
     db.commit()
-    db.refresh(loan)
-    return {"ok": True, "loan": loan.to_dict()}
+    db.refresh(eq)
+    return {"ok": True, "equipment": eq.to_dict()}
 
 
-@app.post("/api/loans/{loan_id}/retrieve")
-def retrieve_loan(loan_id: int, req: LoanActionReq, db: Session = Depends(get_db)):
-    """El técnico marca que ya retiró el equipo del cliente."""
-    loan = db.get(Loan, loan_id)
-    if not loan or loan.deleted:
-        raise HTTPException(404, "Préstamo inexistente")
-    loan.estado = "retirado"
-    loan.fecha_retiro = now_ms()
-    loan.retirado_por = req.tecnico
+@app.put("/api/equipment/{eq_id}", dependencies=[Depends(require_admin)])
+def edit_equipment(eq_id: int, req: EquipmentEditReq, db: Session = Depends(get_db)):
+    eq = db.get(Equipment, eq_id)
+    if not eq or eq.deleted:
+        raise HTTPException(404, "Equipo inexistente")
+    if req.nombre is not None:
+        eq.nombre = req.nombre.strip()
+    if req.tipo is not None:
+        eq.tipo = req.tipo
+    if req.photo is not None:
+        eq.photo = _strip_b64(req.photo) if req.photo else None
     db.commit()
-    return {"ok": True, "loan": loan.to_dict()}
+    return {"ok": True, "equipment": eq.to_dict()}
 
 
-@app.delete("/api/loans/{loan_id}", dependencies=[Depends(require_admin)])
-def delete_loan(loan_id: int, db: Session = Depends(get_db)):
-    loan = db.get(Loan, loan_id)
-    if not loan:
-        raise HTTPException(404, "Préstamo inexistente")
-    loan.deleted = True
+@app.delete("/api/equipment/{eq_id}", dependencies=[Depends(require_admin)])
+def delete_equipment(eq_id: int, db: Session = Depends(get_db)):
+    eq = db.get(Equipment, eq_id)
+    if not eq:
+        raise HTTPException(404, "Equipo inexistente")
+    eq.deleted = True
     db.commit()
     return {"ok": True}
+
+
+@app.post("/api/equipment/{eq_id}/lend")
+def lend_equipment(eq_id: int, req: LendReq, db: Session = Depends(get_db)):
+    """El técnico presta un equipo a un cliente (lo pasa a en_prestamo)."""
+    eq = db.get(Equipment, eq_id)
+    if not eq or eq.deleted:
+        raise HTTPException(404, "Equipo inexistente")
+    if eq.estado == "en_prestamo":
+        raise HTTPException(409, "El equipo ya está en préstamo")
+    if not req.cliente.strip():
+        raise HTTPException(400, "Falta el cliente")
+    eq.estado = "en_prestamo"
+    eq.cliente = req.cliente.strip()
+    eq.dias = req.dias
+    eq.tecnico = req.tecnico
+    eq.area = req.area
+    eq.fecha_salida = now_ms()
+    db.commit()
+    return {"ok": True, "equipment": eq.to_dict()}
+
+
+@app.post("/api/equipment/{eq_id}/return")
+def return_equipment(eq_id: int, req: ReturnReq, db: Session = Depends(get_db)):
+    """Se devuelve el equipo: vuelve a disponible y se limpian los datos del préstamo."""
+    eq = db.get(Equipment, eq_id)
+    if not eq or eq.deleted:
+        raise HTTPException(404, "Equipo inexistente")
+    eq.estado = "disponible"
+    eq.cliente = None
+    eq.dias = None
+    eq.tecnico = None
+    eq.area = None
+    eq.fecha_salida = None
+    db.commit()
+    return {"ok": True, "equipment": eq.to_dict()}
